@@ -1,0 +1,176 @@
+%matplotlib inline
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+import easyocr
+
+# ==========================================
+# 1. CARREGAMENTO DO MODELO E IMAGEM
+# ==========================================
+model = YOLO('best.pt') 
+reader = easyocr.Reader(['en'], gpu=True)
+
+caminho_imagem = 'teste_circuito.png' 
+img_bgr = cv2.imread(caminho_imagem)
+
+if img_bgr is None:
+    raise FileNotFoundError(f"A imagem '{caminho_imagem}' não foi encontrada no Colab.")
+
+results = model.predict(source=caminho_imagem, imgsz=640, conf=0.18)[0]
+
+# ==========================================
+# 2. TRATAMENTO DA IMAGEM E CORREÇÃO DE ILUMINAÇÃO
+# ==========================================
+gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+fundo_estimado = cv2.medianBlur(gray, 51)
+gray_flat = cv2.divide(gray, fundo_estimado, scale=255)
+
+_, mascara_fios = cv2.threshold(gray_flat, 210, 255, cv2.THRESH_BINARY_INV)
+
+margin_border = 25
+mascara_fios[:margin_border, :] = 0
+mascara_fios[-margin_border:, :] = 0
+mascara_fios[:, :margin_border] = 0
+mascara_fios[:, -margin_border:] = 0
+
+# ==========================================
+# 3. FILTRAGEM DE OBJETOS (CORTES E REMOÇÕES)
+# ==========================================
+componentes = []
+textos = []
+
+img_resultado = img_bgr.copy()
+
+kw_unir = ['0', 'quina', 'ponto', 'no', 'node', 'juncao', 'dot', 'corner']
+kw_apagar = ['txt', 'text', 'seta', 'arrow', 'texto', 'tensao', 'v', 'va', 'vb', 'vc']
+
+for box in results.boxes:
+    x1, y1, x2, y2 = map(int, box.xyxy[0])
+    cls_id = int(box.cls[0])
+    nome_classe = model.names[cls_id].lower()
+    
+    if cls_id in [8, 9] or any(kw in nome_classe for kw in kw_apagar):
+        cv2.rectangle(img_resultado, (x1, y1), (x2, y2), (255, 165, 0), 2)
+        crop_txt = img_bgr[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+        ocr_res = reader.readtext(crop_txt, detail=0) if crop_txt.size > 0 else []
+        texto_lido = ocr_res[0].strip() if len(ocr_res) > 0 else "Txt"
+        textos.append({'texto': texto_lido, 'centro': ((x1+x2)//2, (y1+y2)//2)})
+        
+        margem = 25
+        cv2.rectangle(mascara_fios, (max(0, x1-margem), max(0, y1-margem)), 
+                      (min(mascara_fios.shape[1], x2+margem), min(mascara_fios.shape[0], y2+margem)), 0, -1)
+                      
+    elif cls_id == 0 or any(kw == nome_classe or kw in nome_classe for kw in kw_unir):
+        cv2.rectangle(img_resultado, (x1, y1), (x2, y2), (0, 255, 0), 1)
+
+    else:
+        cv2.rectangle(img_resultado, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.putText(img_resultado, model.names[cls_id], (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        componentes.append({
+            'classe': model.names[cls_id], 'bbox': (x1, y1, x2, y2),
+            'centro': ((x1+x2)//2, (y1+y2)//2), 'nome_rotulo': model.names[cls_id]
+        })
+        
+        margem = 15
+        cv2.rectangle(mascara_fios, (max(0, x1-margem), max(0, y1-margem)), 
+                      (min(mascara_fios.shape[1], x2+margem), min(mascara_fios.shape[0], y2+margem)), 0, -1)
+
+# ==========================================
+# 4. UNIFICAÇÃO LIGEIRA DE LINHAS INTERROMPIDAS
+# ==========================================
+kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 3))
+kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 17))
+
+mask_h = cv2.morphologyEx(mascara_fios, cv2.MORPH_CLOSE, kernel_h)
+mask_v = cv2.morphologyEx(mascara_fios, cv2.MORPH_CLOSE, kernel_v)
+
+mascara_fios = cv2.bitwise_or(mask_h, mask_v)
+
+for comp in componentes:
+    cx, cy = comp['centro']
+    dist_min = float('inf')
+    rotulo = comp['classe']
+    for txt in textos:
+        tx, ty = txt['centro']
+        dist = np.sqrt((cx-tx)**2 + (cy-ty)**2)
+        if dist < 220 and dist < dist_min:
+            dist_min = dist
+            rotulo = txt['texto']
+    comp['nome_rotulo'] = rotulo
+
+# ==========================================
+# 5. IDENTIFICAÇÃO E PINTURA EXCLUSIVA DOS FIOS
+# ==========================================
+num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mascara_fios)
+
+def no_toca_componente(label_id, bbox_list, margin=20):
+    mask_component = (labels == label_id)
+    for comp in bbox_list:
+        x1, y1, x2, y2 = comp['bbox']
+        h, w = labels.shape
+        x1_m, x2_m = max(0, x1 - margin), min(w, x2 + margin)
+        y1_m, y2_m = max(0, y1 - margin), min(h, y2 + margin)
+        if np.any(mask_component[y1_m:y2_m, x1_m:x2_m]):
+            return True
+    return False
+
+mapa_nos = {}
+contador_nos = 1
+
+cores_vivas = [[255, 0, 0], [0, 200, 255], [0, 255, 0], [255, 0, 255], 
+               [0, 255, 255], [200, 200, 200], [0, 100, 255], [255, 100, 0]]
+
+for i in range(1, num_labels):
+    area = stats[i, cv2.CC_STAT_AREA]
+    
+    if area > 100 and no_toca_componente(i, componentes):
+        nome_no = f"N{contador_nos:03d}"
+        mapa_nos[i] = nome_no
+        
+        mascara_no = (labels == i)
+        img_resultado[mascara_no] = cores_vivas[(contador_nos - 1) % len(cores_vivas)]
+        
+        cx, cy = int(centroids[i][0]), int(centroids[i][1])
+        cv2.putText(img_resultado, nome_no, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 3)
+        cv2.putText(img_resultado, nome_no, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        contador_nos += 1
+
+# ==========================================
+# 6. GERAR TABELA NETLIST E EXIBIR
+# ==========================================
+def extrair_nos_do_componente(labels_img, bbox, mapa, margin=20):
+    x1, y1, x2, y2 = bbox
+    h, w = labels_img.shape
+    x1_m, x2_m = max(0, x1 - margin), min(w, x2 + margin)
+    y1_m, y2_m = max(0, y1 - margin), min(h, y2 + margin)
+    sub_mask = labels_img[y1_m:y2_m, x1_m:x2_m].copy()
+    if sub_mask.shape[0] > 2*margin and sub_mask.shape[1] > 2*margin:
+        sub_mask[margin:-margin, margin:-margin] = 0
+    u_ids = np.unique(sub_mask)
+    return list(dict.fromkeys([mapa[uid] for uid in u_ids if uid in mapa]))
+
+netlist_data = []
+for comp in componentes:
+    nos = extrair_nos_do_componente(labels, comp['bbox'], mapa_nos)
+    netlist_data.append({
+        'Componente / Rótulo': comp['nome_rotulo'],
+        'Tipo de Elemento': comp['classe'],
+        'Nó Terminal 1': nos[0] if len(nos) > 0 else "NC",
+        'Nó Terminal 2': nos[1] if len(nos) > 1 else "NC"
+    })
+
+# EXIBE A IMAGEM PRIMEIRO
+plt.figure(figsize=(16, 12))
+plt.imshow(cv2.cvtColor(img_resultado, cv2.COLOR_BGR2RGB))
+plt.axis('off')
+plt.title("Segmentação do Circuito e Identificação dos Nós", fontsize=16)
+plt.show()
+
+# EXIBE A TABELA DEPOIS
+print("\n" + "="*50)
+print("             NETLIST DO CIRCUITO             ")
+print("="*50)
+display(pd.DataFrame(netlist_data))
