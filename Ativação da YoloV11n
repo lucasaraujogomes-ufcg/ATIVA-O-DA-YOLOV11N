@@ -1,0 +1,20 @@
+# 1. Instalar as bibliotecas necessárias no Colab
+!pip install ultralytics easyocr opencv-python-headless pandas matplotlib
+
+# 2. Inicialização do YOLOv11 Nano e EasyOCR
+import os
+from ultralytics import YOLO
+import easyocr
+
+caminho_modelo = 'best.pt'  # Caminho relativo correto para o Colab
+
+if not os.path.exists(caminho_modelo):
+    raise FileNotFoundError(
+        "O arquivo 'best.pt' não foi encontrado no Colab!\n"
+        "-> Clique no ícone de pasta (📁) na barra lateral esquerda do Colab e faça o upload do 'best.pt'."
+    )
+
+model = YOLO(caminho_modelo)
+reader = easyocr.Reader(['en'], gpu=True)
+
+print("YOLOv11 Nano e EasyOCR inicializados com sucesso!")
